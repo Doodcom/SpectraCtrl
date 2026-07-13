@@ -19,6 +19,15 @@ function findSpectractl() {
 
 const BIN = findSpectractl();
 
+// KDE Wayland + Vulkan clashes with Electron's Wayland ozone backend
+// (blank window / no launch). XWayland is always available — use it.
+// GPU acceleration buys nothing for a small control panel and its
+// sandbox trips over the split Mesa GBM loader — skip it entirely.
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('ozone-platform', 'x11');
+  app.disableHardwareAcceleration();
+}
+
 function run(args) {
   return new Promise((resolve) => {
     execFile(BIN, args, { timeout: 20000 }, (err, stdout, stderr) => {
