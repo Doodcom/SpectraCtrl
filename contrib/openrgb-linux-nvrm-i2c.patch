@@ -1,0 +1,850 @@
+From 33dfc6f39e277a287e6beddc5c08f8fbb9769248 Mon Sep 17 00:00:00 2001
+From: doodcom <doodcom@vortex.local>
+Date: Mon, 13 Jul 2026 04:02:49 +0100
+Subject: [PATCH] Add Linux NVIDIA RM API i2c backend for slow-speed GPU RGB
+ controllers
+
+The kernel's /dev/i2c-* adapters for NVIDIA GPUs run at a fixed
+100 kHz, so the Zotac Spectra RGB MCU (0x4A, 10 kHz only) never
+responds on Linux and the Zotac 4A controller was Windows-only.
+
+This adds i2c_smbus_nvrm, a Linux bus implementation that issues
+transactions through the NVIDIA Resource Manager
+(NV402C_CTRL_CMD_I2C_TRANSACTION via /dev/nvidiactl) with the
+per-transaction speed-mode flag - the same RM control NvAPI wraps
+on Windows. i2c_set_max_speed() maps Hz to the RM speed flag, so
+DetectZotac4AGPUControllers() works unmodified.
+
+To avoid double detection of devices already reachable through
+/dev/i2c-*, the bus refuses transfers until a detector requests a
+reduced speed.
+
+Tested on a ZOTAC RTX 4070 Ti SUPER Trinity Black (19DA:4710,
+N702E-1002), driver 610.43.03 open kernel modules: detection,
+all modes, and color control work; no duplicates, no root needed.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ LINUX_NVRM_NOTES.md                |  49 +++
+ OpenRGB.pro                        |   3 +
+ i2c_smbus/Linux/i2c_smbus_nvrm.cpp | 463 +++++++++++++++++++++++++++++
+ i2c_smbus/Linux/i2c_smbus_nvrm.h   |  41 +++
+ i2c_smbus/Linux/nvrm_api.h         | 211 +++++++++++++
+ 5 files changed, 767 insertions(+)
+ create mode 100644 LINUX_NVRM_NOTES.md
+ create mode 100644 i2c_smbus/Linux/i2c_smbus_nvrm.cpp
+ create mode 100644 i2c_smbus/Linux/i2c_smbus_nvrm.h
+ create mode 100644 i2c_smbus/Linux/nvrm_api.h
+
+diff --git a/LINUX_NVRM_NOTES.md b/LINUX_NVRM_NOTES.md
+new file mode 100644
+index 0000000..633ccec
+--- /dev/null
++++ b/LINUX_NVRM_NOTES.md
+@@ -0,0 +1,49 @@
++# Linux support for the Zotac 4A GPU controller (RM API i2c backend)
++
++Companion patch to MR !2625 ("Zotac Trinity/Twin Edge"). That MR is
++Windows-only because the Spectra MCU (addr 0x4A) only responds at 10 kHz
++and on Linux the kernel's `/dev/i2c-*` adapters for NVIDIA GPUs run at a
++fixed 100 kHz — `i2c_set_max_speed()` has nothing to act on there.
++
++## What this adds
++
++`i2c_smbus/Linux/i2c_smbus_nvrm.{h,cpp}` + `nvrm_api.h`:
++
++- A Linux i2c bus implementation that issues transactions through the
++  NVIDIA Resource Manager API (`/dev/nvidiactl` + `/dev/nvidiaN`), using
++  `NV402C_CTRL_CMD_I2C_TRANSACTION`. This control accepts a per-transaction
++  speed-mode flag (3/10/33/100/200/300/400 kHz) — it is the exact same RM
++  control NvAPI's i2c functions wrap on Windows.
++- `i2c_set_max_speed()` maps the requested Hz to the RM speed flag, so the
++  existing `DetectZotac4AGPUControllers()` works unmodified on Linux.
++- One bus is registered per NVIDIA GPU (enumerated from
++  `/proc/driver/nvidia/gpus`), carrying the GPU's PCI IDs so
++  `REGISTER_I2C_PCI_DETECTOR` matching works as usual. Port is fixed to 1,
++  mirroring `i2c_smbus_nvapi.cpp` ("Always use GPU port 1").
++
++## Duplicate-detection guard
++
++The RM bus refuses all transfers until a detector has called
++`i2c_set_max_speed()` with a value below 100 kHz. Devices reachable at
++standard speed are already served by the `/dev/i2c-*` buses; without this
++guard every GPU controller would be detected twice.
++
++## ABI / driver compatibility notes
++
++- `nvrm_api.h` defines only the needed subset of the RM ABI (struct
++  layouts verified against NVIDIA/open-gpu-kernel-modules, MIT). The
++  NV402C params struct is 96 bytes with the data union at offset 16;
++  there's a `_Static_assert` guarding this.
++- The RM version handshake uses `NV_RM_API_VERSION_CMD_RELAXED`.
++- Works with both the proprietary and open kernel modules (the escape
++  ioctl interface is identical). Needs R/W access to `/dev/nvidiactl`
++  and `/dev/nvidia0`, which are 0666 by default.
++- No root required.
++
++## Tested
++
++- ZOTAC GAMING RTX 4070 Ti SUPER Trinity Black Edition (10de:2705,
++  19da:4710, controller `N702E-1002`), driver 610.43.03 open kernel
++  modules, CachyOS, Qt 5.15: detected as "ZOTAC GAMING GeForce RTX 4070
++  Ti Super Trinity", all modes and colors apply correctly, settings
++  persist. DRAM/motherboard devices unaffected, no duplicates.
+diff --git a/OpenRGB.pro b/OpenRGB.pro
+index 4a4fd8a..789d49d 100644
+--- a/OpenRGB.pro
++++ b/OpenRGB.pro
+@@ -470,6 +470,8 @@ contains(QMAKE_PLATFORM, linux) {
+     HEADERS +=                                                                                  \
+     dependencies/NVFC/nvapi.h                                                                   \
+     i2c_smbus/Linux/i2c_smbus_linux.h                                                           \
++    i2c_smbus/Linux/i2c_smbus_nvrm.h                                                            \
++    i2c_smbus/Linux/nvrm_api.h                                                                  \
+     AutoStart/AutoStart-Linux.h                                                                 \
+     SPDAccessor/EE1004Accessor_Linux.h                                                          \
+     SPDAccessor/SPD5118Accessor_Linux.h                                                         \
+@@ -526,6 +528,7 @@ contains(QMAKE_PLATFORM, linux) {
+     dependencies/hueplusplus-1.2.0/src/LinHttpHandler.cpp                                       \
+     dependencies/NVFC/nvapi.cpp                                                                 \
+     i2c_smbus/Linux/i2c_smbus_linux.cpp                                                         \
++    i2c_smbus/Linux/i2c_smbus_nvrm.cpp                                                          \
+     scsiapi/scsiapi_linux.c                                                                     \
+     serial_port/find_usb_serial_port_linux.cpp                                                  \
+     AutoStart/AutoStart-Linux.cpp                                                               \
+diff --git a/i2c_smbus/Linux/i2c_smbus_nvrm.cpp b/i2c_smbus/Linux/i2c_smbus_nvrm.cpp
+new file mode 100644
+index 0000000..7ac0206
+--- /dev/null
++++ b/i2c_smbus/Linux/i2c_smbus_nvrm.cpp
+@@ -0,0 +1,463 @@
++/*---------------------------------------------------------*\
++| i2c_smbus_nvrm.cpp                                        |
++|                                                           |
++|   NVIDIA GPU i2c driver for Linux using the Resource      |
++|   Manager API (/dev/nvidiactl).                           |
++|                                                           |
++|   The kernel's /dev/i2c-* adapters for NVIDIA GPUs run    |
++|   at a fixed 100 kHz, so i2c devices that require slower  |
++|   clocks (Zotac Spectra RGB MCUs want 10 kHz) never       |
++|   respond through them. The RM API accepts a per-         |
++|   transaction speed flag - the same mechanism NvAPI       |
++|   exposes on Windows.                                     |
++|                                                           |
++|   To avoid double-detecting devices that are already      |
++|   reachable through /dev/i2c-*, this bus only performs    |
++|   transfers after a detector has requested a reduced      |
++|   speed via i2c_set_max_speed(); at default speed all     |
++|   transfers report failure immediately.                   |
++|                                                           |
++|   This file is part of the OpenRGB project                |
++|   SPDX-License-Identifier: GPL-2.0-only                   |
++\*---------------------------------------------------------*/
++
++#include <fcntl.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <cstring>
++#include <cstdio>
++#include <cctype>
++#include <sys/ioctl.h>
++#include "LogManager.h"
++#include "i2c_smbus_nvrm.h"
++
++#define NVRM_H_DEVICE 0x5F524742  /* arbitrary client-chosen handles "_RGB" */
++#define NVRM_H_SUBDEV 0x5F524743
++#define NVRM_H_I2C    0x5F524744
++
++/* NvAPI on Windows always uses GPU port 1 for RGB controllers; the RM
++ * port numbering is the same. */
++#define NVRM_RGB_PORT_ID 1
++
++i2c_smbus_nvrm::i2c_smbus_nvrm()
++{
++    ctl_fd      = -1;
++    dev_fd      = -1;
++    h_client    = 0;
++    speed_flags = NV402C_I2C_SPEED_100KHZ;
++    speed_set   = false;
++}
++
++i2c_smbus_nvrm::~i2c_smbus_nvrm()
++{
++    if(h_client && ctl_fd >= 0)
++    {
++        NVOS00_PARAMETERS f;
++        memset(&f, 0, sizeof(f));
++        f.hRoot         = h_client;
++        f.hObjectParent = h_client;
++        f.hObjectOld    = h_client;
++        nv_ioctl(ctl_fd, NV_ESC_RM_FREE, &f, sizeof(f));
++    }
++    if(dev_fd >= 0)
++    {
++        close(dev_fd);
++    }
++    if(ctl_fd >= 0)
++    {
++        close(ctl_fd);
++    }
++}
++
++int i2c_smbus_nvrm::nv_ioctl(int fd, unsigned cmd, void* data, size_t size)
++{
++    return ioctl(fd, _IOC(_IOC_READ|_IOC_WRITE, NV_IOCTL_MAGIC, cmd, size), data);
++}
++
++NvU32 i2c_smbus_nvrm::rm_alloc(NvHandle parent, NvHandle hnew, NvU32 hclass,
++                               void* parms, NvU32 parms_size, NvHandle* out)
++{
++    NVOS21_PARAMETERS p;
++    memset(&p, 0, sizeof(p));
++    p.hRoot         = h_client;
++    p.hObjectParent = parent;
++    p.hObjectNew    = hnew;
++    p.hClass        = hclass;
++    p.pAllocParms   = (NvP64)(uintptr_t)parms;
++    p.paramsSize    = parms_size;
++    if(nv_ioctl(ctl_fd, NV_ESC_RM_ALLOC, &p, sizeof(p)) < 0)
++    {
++        return 0xFFFFFFFF;
++    }
++    if(p.status == 0 && out)
++    {
++        *out = p.hObjectNew;
++    }
++    return p.status;
++}
++
++NvU32 i2c_smbus_nvrm::rm_i2c(NV402C_CTRL_I2C_TRANSACTION_PARAMS* params)
++{
++    NVOS54_PARAMETERS p;
++    memset(&p, 0, sizeof(p));
++    p.hClient    = h_client;
++    p.hObject    = NVRM_H_I2C;
++    p.cmd        = NV402C_CTRL_CMD_I2C_TRANSACTION;
++    p.params     = (NvP64)(uintptr_t)params;
++    p.paramsSize = sizeof(*params);
++    if(nv_ioctl(ctl_fd, NV_ESC_RM_CONTROL, &p, sizeof(p)) < 0)
++    {
++        return 0xFFFFFFFF;
++    }
++    return p.status;
++}
++
++bool i2c_smbus_nvrm::open_gpu(int minor)
++{
++    char devpath[32];
++
++    ctl_fd = open("/dev/nvidiactl", O_RDWR);
++    if(ctl_fd < 0)
++    {
++        return false;
++    }
++
++    snprintf(devpath, sizeof(devpath), "/dev/nvidia%d", minor);
++    dev_fd = open(devpath, O_RDWR);
++    if(dev_fd < 0)
++    {
++        return false;
++    }
++
++    /*-----------------------------------------------------------------*\
++    | Version handshake. RELAXED matching accepts any same-major driver |
++    \*-----------------------------------------------------------------*/
++    nv_ioctl_rm_api_version_t v;
++    memset(&v, 0, sizeof(v));
++    v.cmd = NV_RM_API_VERSION_CMD_RELAXED;
++
++    FILE* f = fopen("/proc/driver/nvidia/version", "r");
++    if(f)
++    {
++        char line[256];
++        if(fgets(line, sizeof(line), f))
++        {
++            for(char* p = line; *p; )
++            {
++                if(isdigit((unsigned char)*p))
++                {
++                    int dots = 0;
++                    char* q = p;
++                    while(isdigit((unsigned char)*q) || *q == '.')
++                    {
++                        if(*q == '.') dots++;
++                        q++;
++                    }
++                    if(dots >= 1 && q - p < (long)sizeof(v.versionString))
++                    {
++                        memcpy(v.versionString, p, q - p);
++                        break;
++                    }
++                    p = q;
++                }
++                else
++                {
++                    p++;
++                }
++            }
++        }
++        fclose(f);
++    }
++
++    if(nv_ioctl(ctl_fd, NV_ESC_CHECK_VERSION_STR, &v, sizeof(v)) < 0
++       || v.reply != NV_RM_API_VERSION_REPLY_RECOGNIZED)
++    {
++        LOG_INFO("[i2c_smbus_nvrm] RM API version handshake failed");
++        return false;
++    }
++
++    if(rm_alloc(0, 0, NV01_ROOT_CLIENT, NULL, 0, &h_client) != 0)
++    {
++        return false;
++    }
++
++    NV0080_ALLOC_PARAMETERS dp;
++    memset(&dp, 0, sizeof(dp));
++    dp.deviceId     = minor;
++    dp.hClientShare = h_client;
++    if(rm_alloc(h_client, NVRM_H_DEVICE, NV01_DEVICE_0, &dp, sizeof(dp), NULL) != 0)
++    {
++        return false;
++    }
++
++    NV2080_ALLOC_PARAMETERS sp;
++    memset(&sp, 0, sizeof(sp));
++    if(rm_alloc(NVRM_H_DEVICE, NVRM_H_SUBDEV, NV20_SUBDEVICE_0, &sp, sizeof(sp), NULL) != 0)
++    {
++        return false;
++    }
++
++    if(rm_alloc(NVRM_H_SUBDEV, NVRM_H_I2C, NV40_I2C, NULL, 0, NULL) != 0)
++    {
++        return false;
++    }
++
++    return true;
++}
++
++void i2c_smbus_nvrm::i2c_set_max_speed(int hz)
++{
++    if(hz <= 0 || hz >= 100000)
++    {
++        speed_flags = NV402C_I2C_SPEED_100KHZ;
++        speed_set   = false;
++    }
++    else if(hz <= 3000)
++    {
++        speed_flags = NV402C_I2C_SPEED_3KHZ;
++        speed_set   = true;
++    }
++    else if(hz <= 10000)
++    {
++        speed_flags = NV402C_I2C_SPEED_10KHZ;
++        speed_set   = true;
++    }
++    else
++    {
++        speed_flags = NV402C_I2C_SPEED_33KHZ;
++        speed_set   = true;
++    }
++}
++
++s32 i2c_smbus_nvrm::i2c_smbus_xfer(u8 addr, char read_write, u8 command, int size, i2c_smbus_data* data)
++{
++    /*-----------------------------------------------------------------*\
++    | Refuse transfers at default speed: those devices are reachable    |
++    | through /dev/i2c-* already and would be detected twice.           |
++    \*-----------------------------------------------------------------*/
++    if(!speed_set)
++    {
++        return -1;
++    }
++
++    NV402C_CTRL_I2C_TRANSACTION_PARAMS t;
++    memset(&t, 0, sizeof(t));
++    t.portId        = NVRM_RGB_PORT_ID;
++    t.flags         = speed_flags;
++    t.deviceAddress = (NvU16)(addr << 1);
++
++    bool is_write = (read_write == I2C_SMBUS_WRITE);
++
++    switch(size)
++    {
++        case I2C_SMBUS_QUICK:
++            t.transType = NV402C_TRANS_SMBUS_QUICK_RW;
++            t.transData.smbusQuickData.bWrite = is_write;
++            break;
++
++        case I2C_SMBUS_BYTE:
++            t.transType = NV402C_TRANS_I2C_BYTE_RW;
++            t.transData.i2cByteData.bWrite  = is_write;
++            t.transData.i2cByteData.message = is_write ? command : 0;
++            break;
++
++        case I2C_SMBUS_BYTE_DATA:
++            t.transType = NV402C_TRANS_SMBUS_BYTE_RW;
++            t.transData.smbusByteData.bWrite          = is_write;
++            t.transData.smbusByteData.registerAddress = command;
++            t.transData.smbusByteData.message         = is_write ? data->byte : 0;
++            break;
++
++        case I2C_SMBUS_WORD_DATA:
++            t.transType = NV402C_TRANS_SMBUS_WORD_RW;
++            t.transData.smbusWordData.bWrite          = is_write;
++            t.transData.smbusWordData.registerAddress = command;
++            t.transData.smbusWordData.message         = is_write ? data->word : 0;
++            break;
++
++        case I2C_SMBUS_BLOCK_DATA:
++            t.transType = NV402C_TRANS_SMBUS_BLOCK_RW;
++            t.transData.smbusBlockData.bWrite          = is_write;
++            t.transData.smbusBlockData.registerAddress = command;
++            t.transData.smbusBlockData.messageLength   = data->block[0];
++            t.transData.smbusBlockData.pMessage        = (NvP64)(uintptr_t)&data->block[1];
++            break;
++
++        case I2C_SMBUS_I2C_BLOCK_DATA:
++            /* i2c "block" - register address, repeated start, no count byte */
++            t.transType = NV402C_TRANS_I2C_BUFFER_RW;
++            t.transData.i2cBufferData.bWrite          = is_write;
++            t.transData.i2cBufferData.registerAddress = command;
++            t.transData.i2cBufferData.messageLength   = data->block[0];
++            t.transData.i2cBufferData.pMessage        = (NvP64)(uintptr_t)&data->block[1];
++            break;
++
++        default:
++            return -1;
++    }
++
++    NvU32 status = rm_i2c(&t);
++    if(status != 0)
++    {
++        LOG_TRACE("[i2c_smbus_nvrm] xfer addr=0x%02X size=%d rw=%d speed_flags=0x%X -> RM status 0x%08X",
++                  addr, size, read_write, speed_flags, status);
++        return -1;
++    }
++
++    if(!is_write)
++    {
++        switch(size)
++        {
++            case I2C_SMBUS_BYTE:
++                data->byte = t.transData.i2cByteData.message;
++                break;
++            case I2C_SMBUS_BYTE_DATA:
++                data->byte = t.transData.smbusByteData.message;
++                break;
++            case I2C_SMBUS_WORD_DATA:
++                data->word = t.transData.smbusWordData.message;
++                break;
++            case I2C_SMBUS_BLOCK_DATA:
++                data->block[0] = (u8)t.transData.smbusBlockData.messageLength;
++                break;
++            case I2C_SMBUS_I2C_BLOCK_DATA:
++                data->block[0] = (u8)t.transData.i2cBufferData.messageLength;
++                break;
++        }
++    }
++
++    return 0;
++}
++
++s32 i2c_smbus_nvrm::i2c_xfer(u8 addr, char read_write, int* size, u8* data)
++{
++    if(!speed_set)
++    {
++        return -1;
++    }
++
++    NV402C_CTRL_I2C_TRANSACTION_PARAMS t;
++    memset(&t, 0, sizeof(t));
++    t.portId        = NVRM_RGB_PORT_ID;
++    t.flags         = speed_flags;
++    t.deviceAddress = (NvU16)(addr << 1);
++    t.transType     = NV402C_TRANS_I2C_BLOCK_RW;
++    t.transData.i2cBlockData.bWrite        = (read_write == I2C_SMBUS_WRITE);
++    t.transData.i2cBlockData.messageLength = *size;
++    t.transData.i2cBlockData.pMessage      = (NvP64)(uintptr_t)data;
++
++    NvU32 status = rm_i2c(&t);
++    if(status != 0)
++    {
++        return -1;
++    }
++
++    if(read_write == I2C_SMBUS_READ)
++    {
++        *size = t.transData.i2cBlockData.messageLength;
++    }
++
++    return 0;
++}
++
++/******************************************************************************************\
++*                                                                                          *
++*   i2c_smbus_nvrm_detect                                                                  *
++*                                                                                          *
++*       Registers one RM-API i2c bus per NVIDIA GPU, carrying the GPU's PCI IDs so         *
++*       that REGISTER_I2C_PCI_DETECTOR entries match against it.                           *
++*                                                                                          *
++\******************************************************************************************/
++
++#include "Detector.h"
++#include "ResourceManager.h"
++
++bool i2c_smbus_nvrm_detect()
++{
++    DIR* dir = opendir("/proc/driver/nvidia/gpus");
++    if(dir == NULL)
++    {
++        return(false);
++    }
++
++    struct dirent* ent;
++    while((ent = readdir(dir)) != NULL)
++    {
++        if(ent->d_name[0] == '.')
++        {
++            continue;
++        }
++
++        /*-------------------------------------------------------------*\
++        | Read PCI IDs from sysfs and the device minor from procfs      |
++        \*-------------------------------------------------------------*/
++        char path[512];
++        char buff[128];
++        unsigned int pci_vendor = 0, pci_device = 0;
++        unsigned int pci_subsystem_vendor = 0, pci_subsystem_device = 0;
++        int minor = -1;
++
++        snprintf(path, sizeof(path), "/proc/driver/nvidia/gpus/%s/information", ent->d_name);
++        FILE* f = fopen(path, "r");
++        if(f == NULL)
++        {
++            continue;
++        }
++        while(fgets(buff, sizeof(buff), f))
++        {
++            sscanf(buff, "Device Minor: %d", &minor);
++        }
++        fclose(f);
++        if(minor < 0)
++        {
++            continue;
++        }
++
++        const struct { const char* file; unsigned int* val; } ids[] =
++        {
++            { "vendor",           &pci_vendor           },
++            { "device",           &pci_device           },
++            { "subsystem_vendor", &pci_subsystem_vendor },
++            { "subsystem_device", &pci_subsystem_device },
++        };
++        for(unsigned int i = 0; i < 4; i++)
++        {
++            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/%s", ent->d_name, ids[i].file);
++            f = fopen(path, "r");
++            if(f)
++            {
++                if(fgets(buff, sizeof(buff), f))
++                {
++                    *ids[i].val = strtoul(buff, NULL, 16);
++                }
++                fclose(f);
++            }
++        }
++
++        i2c_smbus_nvrm* bus = new i2c_smbus_nvrm();
++        if(!bus->open_gpu(minor))
++        {
++            delete bus;
++            continue;
++        }
++
++        snprintf(bus->device_name, sizeof(bus->device_name),
++                 "NVIDIA RM i2c port %d (GPU %s)", NVRM_RGB_PORT_ID, ent->d_name);
++        bus->pci_vendor           = pci_vendor;
++        bus->pci_device           = pci_device;
++        bus->pci_subsystem_vendor = pci_subsystem_vendor;
++        bus->pci_subsystem_device = pci_subsystem_device;
++        bus->port_id              = NVRM_RGB_PORT_ID;
++        bus->bus_id               = minor;
++        ResourceManager::get()->RegisterI2CBus(bus);
++
++        LOG_INFO("[i2c_smbus_nvrm] registered RM i2c bus for GPU %s (%04X:%04X %04X:%04X)",
++                 ent->d_name, pci_vendor, pci_device,
++                 pci_subsystem_vendor, pci_subsystem_device);
++    }
++    closedir(dir);
++
++    return(true);
++}
++
++REGISTER_I2C_BUS_DETECTOR(i2c_smbus_nvrm_detect);
+diff --git a/i2c_smbus/Linux/i2c_smbus_nvrm.h b/i2c_smbus/Linux/i2c_smbus_nvrm.h
+new file mode 100644
+index 0000000..b6d40ab
+--- /dev/null
++++ b/i2c_smbus/Linux/i2c_smbus_nvrm.h
+@@ -0,0 +1,41 @@
++/*---------------------------------------------------------*\
++| i2c_smbus_nvrm.h                                          |
++|                                                           |
++|   NVIDIA GPU i2c driver for Linux using the Resource      |
++|   Manager API (/dev/nvidiactl), which supports per-       |
++|   transaction bus speed selection - required by slow      |
++|   RGB controllers (e.g. Zotac Spectra at 10 kHz) that     |
++|   the fixed-100kHz /dev/i2c-* adapters cannot reach.      |
++|                                                           |
++|   This file is part of the OpenRGB project                |
++|   SPDX-License-Identifier: GPL-2.0-only                   |
++\*---------------------------------------------------------*/
++
++#pragma once
++
++#include "i2c_smbus.h"
++#include "nvrm_api.h"
++
++class i2c_smbus_nvrm : public i2c_smbus_interface
++{
++public:
++    i2c_smbus_nvrm();
++    ~i2c_smbus_nvrm();
++
++    bool open_gpu(int minor);
++
++    s32 i2c_smbus_xfer(u8 addr, char read_write, u8 command, int size, i2c_smbus_data* data);
++    s32 i2c_xfer(u8 addr, char read_write, int* size, u8* data);
++    void i2c_set_max_speed(int hz);
++
++private:
++    int      ctl_fd;
++    int      dev_fd;
++    NvHandle h_client;
++    NvU32    speed_flags;
++    bool     speed_set;
++
++    int   nv_ioctl(int fd, unsigned cmd, void* data, size_t size);
++    NvU32 rm_alloc(NvHandle parent, NvHandle hnew, NvU32 hclass, void* parms, NvU32 parms_size, NvHandle* out);
++    NvU32 rm_i2c(NV402C_CTRL_I2C_TRANSACTION_PARAMS* params);
++};
+diff --git a/i2c_smbus/Linux/nvrm_api.h b/i2c_smbus/Linux/nvrm_api.h
+new file mode 100644
+index 0000000..36909be
+--- /dev/null
++++ b/i2c_smbus/Linux/nvrm_api.h
+@@ -0,0 +1,211 @@
++/*---------------------------------------------------------*\
++| nvrm_api.h                                                |
++|                                                           |
++|   Minimal NVIDIA Resource Manager API definitions for     |
++|   issuing I2C transactions through /dev/nvidiactl on      |
++|   Linux. Struct layouts and constants are the stable      |
++|   kernel<->userspace ABI of the NVIDIA driver, taken      |
++|   from NVIDIA/open-gpu-kernel-modules (MIT licensed):     |
++|     kernel-open/common/inc/nv-ioctl-numbers.h             |
++|     src/nvidia/arch/nvalloc/unix/include/nv_escape.h      |
++|     src/common/sdk/nvidia/inc/nvos.h                      |
++|     src/common/sdk/nvidia/inc/ctrl/ctrl402c.h             |
++|                                                           |
++|   This file is part of the OpenRGB project                |
++|   SPDX-License-Identifier: GPL-2.0-only                   |
++\*---------------------------------------------------------*/
++
++#pragma once
++
++#include <stdint.h>
++
++typedef uint8_t  NvU8;
++typedef uint16_t NvU16;
++typedef uint32_t NvU32;
++typedef uint64_t NvU64;
++typedef uint32_t NvHandle;
++typedef uint32_t NvV32;
++typedef NvU8     NvBool;
++typedef NvU64    NvP64;      /* 64-bit pointer container */
++
++/* ioctl plumbing (nv-ioctl-numbers.h) */
++#define NV_IOCTL_MAGIC              'F'
++
++/* escape codes (nv_escape.h) */
++#define NV_ESC_RM_CONTROL           0x2A
++#define NV_ESC_RM_ALLOC             0x2B
++#define NV_ESC_RM_FREE              0x29
++#define NV_ESC_CHECK_VERSION_STR    (200 + 10)   /* NV_IOCTL_BASE + 10 */
++
++/* version handshake (nv-ioctl.h) */
++#define NV_RM_API_VERSION_STRING_LENGTH 64
++#define NV_RM_API_VERSION_CMD_RELAXED   '1'
++#define NV_RM_API_VERSION_REPLY_RECOGNIZED 1
++
++typedef struct
++{
++    NvU32 cmd;
++    NvU32 reply;
++    char  versionString[NV_RM_API_VERSION_STRING_LENGTH];
++} nv_ioctl_rm_api_version_t;
++
++/* object classes */
++#define NV01_ROOT_CLIENT            0x00000041
++#define NV01_DEVICE_0               0x00000080
++#define NV20_SUBDEVICE_0            0x00002080
++#define NV40_I2C                    0x0000402C
++
++/* NVOS21_PARAMETERS - NV_ESC_RM_ALLOC (nvos.h) */
++typedef struct
++{
++    NvHandle hRoot;
++    NvHandle hObjectParent;
++    NvHandle hObjectNew;
++    NvV32    hClass;
++    NvP64    pAllocParms __attribute__((aligned(8)));
++    NvU32    paramsSize;
++    NvV32    status;
++} NVOS21_PARAMETERS;
++
++/* NVOS54_PARAMETERS - NV_ESC_RM_CONTROL (nvos.h) */
++typedef struct
++{
++    NvHandle hClient;
++    NvHandle hObject;
++    NvV32    cmd;
++    NvU32    flags;
++    NvP64    params __attribute__((aligned(8)));
++    NvU32    paramsSize;
++    NvV32    status;
++} NVOS54_PARAMETERS;
++
++/* NVOS00_PARAMETERS - NV_ESC_RM_FREE (nvos.h) */
++typedef struct
++{
++    NvHandle hRoot;
++    NvHandle hObjectParent;
++    NvHandle hObjectOld;
++    NvV32    status;
++} NVOS00_PARAMETERS;
++
++/* NV0080_ALLOC_PARAMETERS (cl0080.h) */
++typedef struct
++{
++    NvU32    deviceId;
++    NvHandle hClientShare;
++    NvHandle hTargetClient;
++    NvHandle hTargetDevice;
++    NvV32    flags;
++    NvU64    vaSpaceSize      __attribute__((aligned(8)));
++    NvU64    vaStartInternal  __attribute__((aligned(8)));
++    NvU64    vaLimitInternal  __attribute__((aligned(8)));
++    NvV32    vaMode;
++} NV0080_ALLOC_PARAMETERS;
++
++/* NV2080_ALLOC_PARAMETERS (cl2080.h) */
++typedef struct
++{
++    NvU32 subDeviceId;
++} NV2080_ALLOC_PARAMETERS;
++
++/* NV402C i2c transaction control (ctrl402c.h) */
++#define NV402C_CTRL_CMD_I2C_TRANSACTION 0x402c0105
++
++/* flags: SPEED_MODE is bitfield 4:1 */
++#define NV402C_I2C_SPEED_100KHZ  (0x0 << 1)
++#define NV402C_I2C_SPEED_200KHZ  (0x1 << 1)
++#define NV402C_I2C_SPEED_400KHZ  (0x2 << 1)
++#define NV402C_I2C_SPEED_33KHZ   (0x3 << 1)
++#define NV402C_I2C_SPEED_10KHZ   (0x4 << 1)
++#define NV402C_I2C_SPEED_3KHZ    (0x5 << 1)
++#define NV402C_I2C_SPEED_300KHZ  (0x7 << 1)
++
++typedef enum
++{
++    NV402C_TRANS_SMBUS_QUICK_RW       = 0,
++    NV402C_TRANS_I2C_BYTE_RW          = 1,
++    NV402C_TRANS_I2C_BLOCK_RW         = 2,
++    NV402C_TRANS_I2C_BUFFER_RW        = 3,
++    NV402C_TRANS_SMBUS_BYTE_RW        = 4,
++    NV402C_TRANS_SMBUS_WORD_RW        = 5,
++    NV402C_TRANS_SMBUS_BLOCK_RW       = 6,
++    NV402C_TRANS_SMBUS_PROCESS_CALL   = 7,
++    NV402C_TRANS_SMBUS_BLK_PROC_CALL  = 8,
++    NV402C_TRANS_SMBUS_MULTIBYTE_RW   = 9,
++} NV402C_TRANS_TYPE;
++
++typedef struct
++{
++    NvBool bWrite;
++} NV402C_DATA_SMBUS_QUICK_RW;
++
++typedef struct
++{
++    NvBool bWrite;
++    NvU8   message;
++} NV402C_DATA_I2C_BYTE_RW;
++
++typedef struct
++{
++    NvBool bWrite;
++    NvU32  messageLength;
++    NvP64  pMessage __attribute__((aligned(8)));
++} NV402C_DATA_I2C_BLOCK_RW;
++
++typedef struct
++{
++    NvBool bWrite;
++    NvU8   registerAddress;
++    NvU8   message;
++} NV402C_DATA_SMBUS_BYTE_RW;
++
++typedef struct
++{
++    NvBool bWrite;
++    NvU8   registerAddress;
++    NvU16  message;
++} NV402C_DATA_SMBUS_WORD_RW;
++
++typedef struct
++{
++    NvBool bWrite;
++    NvU32  warFlags;
++    NvU8   registerAddress;
++    NvU32  messageLength;
++    NvP64  pMessage __attribute__((aligned(8)));
++} NV402C_DATA_I2C_BUFFER_RW;
++
++typedef struct
++{
++    NvBool bWrite;
++    NvU8   registerAddress;
++    NvU32  messageLength;
++    NvP64  pMessage __attribute__((aligned(8)));
++} NV402C_DATA_SMBUS_BLOCK_RW;
++
++/* Union padded to the exact ABI size (80 bytes; largest real member is
++ * the EDID data variant). Total params struct must be 96 bytes with
++ * transData at offset 16 - verified against the SDK headers. */
++typedef union
++{
++    NV402C_DATA_SMBUS_QUICK_RW smbusQuickData;
++    NV402C_DATA_I2C_BYTE_RW    i2cByteData;
++    NV402C_DATA_I2C_BLOCK_RW   i2cBlockData;
++    NV402C_DATA_SMBUS_BYTE_RW  smbusByteData;
++    NV402C_DATA_SMBUS_WORD_RW  smbusWordData;
++    NV402C_DATA_I2C_BUFFER_RW  i2cBufferData;
++    NV402C_DATA_SMBUS_BLOCK_RW smbusBlockData;
++    NvU8 _pad[80];
++} NV402C_TRANS_DATA;
++
++typedef struct
++{
++    NvU8              portId;
++    NvU32             flags;
++    NvU16             deviceAddress;
++    NV402C_TRANS_TYPE transType;
++    NV402C_TRANS_DATA transData __attribute__((aligned(8)));
++} NV402C_CTRL_I2C_TRANSACTION_PARAMS;
++
++static_assert(sizeof(NV402C_CTRL_I2C_TRANSACTION_PARAMS) == 96,
++              "NV402C transaction params ABI size mismatch");
+-- 
+2.55.0
+
