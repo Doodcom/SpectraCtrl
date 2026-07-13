@@ -19,12 +19,12 @@ function findSpectractl() {
 
 const BIN = findSpectractl();
 
-// KDE Wayland + Vulkan clashes with Electron's Wayland ozone backend
-// (blank window / no launch). XWayland is always available — use it.
-// GPU acceleration buys nothing for a small control panel and its
-// sandbox trips over the split Mesa GBM loader — skip it entirely.
+// GPU acceleration buys nothing for a small control panel and causes two
+// failures here: Electron's Wayland backend clashes with Vulkan, and the
+// Chromium GPU sandbox can't open the split Mesa GBM loader. With it off,
+// native Wayland works; the XWayland software presenter does not (window
+// maps but never paints), so don't force x11.
 if (process.platform === 'linux') {
-  app.commandLine.appendSwitch('ozone-platform', 'x11');
   app.disableHardwareAcceleration();
 }
 
