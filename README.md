@@ -49,6 +49,17 @@ spectractl reset                   # controller factory defaults
 Settings are stored in the MCU itself and persist across reboots — set it
 once and forget it. No daemon needed.
 
+## GUI
+
+There's an optional Electron front-end in `gui/`:
+
+```
+cd gui && npm install && npm start
+```
+
+Color picker, effect buttons, speed slider, live status. It just shells
+out to `spectractl`, so install the CLI first.
+
 ## Notes
 
 - The MCU wants ~200 ms between transactions and silently drops anything

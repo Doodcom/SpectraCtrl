@@ -1,0 +1,17 @@
+{
+  "name": "spectractl-gui",
+  "version": "1.0.0",
+  "description": "GUI for SpectraCtrl - Zotac SPECTRA GPU RGB control on Linux",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "license": "GPL-2.0-only",
+  "devDependencies": {
+    "electron": "36.9.5",
+    "playwright-core": "^1.61.1"
+  },
+  "allowScripts": {
+    "electron@36.9.5": true
+  }
+}

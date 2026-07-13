@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SpectraCtrl</title>
+<style>
+  :root {
+    --bg: #101014;
+    --card: #1a1a21;
+    --card2: #22222b;
+    --text: #e8e8ee;
+    --dim: #8a8a99;
+    --accent: #28ff03;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, sans-serif;
+    padding: 18px;
+    font-size: 14px;
+  }
+  h1 {
+    font-size: 17px;
+    letter-spacing: 0.5px;
+    margin-bottom: 2px;
+  }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
+  .card {
+    background: var(--card);
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 12px;
+  }
+  .row { display: flex; align-items: center; justify-content: space-between; }
+  .label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+
+  #swatch {
+    width: 46px; height: 46px; border-radius: 10px;
+    border: 2px solid #333;
+    background: var(--accent);
+    transition: background 0.3s, box-shadow 0.3s;
+  }
+  #statline { font-size: 13px; }
+  #statline b { font-weight: 600; }
+  #chip { color: var(--dim); font-size: 11px; margin-top: 3px; }
+
+  .modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  button.mode {
+    background: var(--card2); color: var(--text);
+    border: 1px solid #2e2e3a; border-radius: 8px;
+    padding: 9px 0; cursor: pointer; font-size: 13px;
+    transition: all 0.15s;
+  }
+  button.mode:hover { border-color: #4a4a5c; }
+  button.mode.active {
+    background: #2a3a22; border-color: var(--accent); color: var(--accent);
+  }
+
+  input[type=color] {
+    width: 100%; height: 44px; border: none; border-radius: 8px;
+    background: var(--card2); cursor: pointer; padding: 4px;
+  }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .slider-row { display: flex; gap: 10px; align-items: center; }
+  #speedval { width: 34px; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; }
+
+  .powerbar { display: flex; gap: 8px; }
+  .powerbar button {
+    flex: 1; padding: 10px 0; border-radius: 8px; border: 1px solid #2e2e3a;
+    background: var(--card2); color: var(--text); cursor: pointer; font-size: 13px;
+  }
+  .powerbar button:hover { border-color: #4a4a5c; }
+  #err {
+    color: #ff5c5c; font-size: 12px; min-height: 16px; margin-top: 4px;
+    white-space: pre-wrap;
+  }
+  .busy { opacity: 0.55; pointer-events: none; }
+</style>
+</head>
+<body>
+  <h1>SpectraCtrl</h1>
+  <div class="sub">Zotac SPECTRA GPU lighting</div>
+
+  <div class="card row" id="statuscard">
+    <div>
+      <div id="statline">reading card…</div>
+      <div id="chip"></div>
+    </div>
+    <div id="swatch"></div>
+  </div>
+
+  <div class="card" id="modecard">
+    <div class="label">Effect</div>
+    <div class="modes">
+      <button class="mode" data-mode="static">Static</button>
+      <button class="mode" data-mode="breathe">Breathe</button>
+      <button class="mode" data-mode="fade">Fade</button>
+      <button class="mode" data-mode="wink">Wink</button>
+      <button class="mode" data-mode="spectrum">Spectrum</button>
+      <button class="mode" data-mode="random">Random</button>
+    </div>
+  </div>
+
+  <div class="card" id="colorcard">
+    <div class="label">Color</div>
+    <input type="color" id="color" value="#28ff03">
+  </div>
+
+  <div class="card" id="speedcard">
+    <div class="label">Speed</div>
+    <div class="slider-row">
+      <input type="range" id="speed" min="1" max="253" value="209">
+      <span id="speedval">209</span>
+    </div>
+  </div>
+
+  <div class="powerbar">
+    <button id="on">Lights on</button>
+    <button id="off">Lights off</button>
+  </div>
+  <div id="err"></div>
+
+<script>
+  const $ = (s) => document.querySelector(s);
+  const NEEDS_COLOR = new Set(['static', 'breathe', 'wink']);
+  const NEEDS_SPEED = new Set(['breathe', 'fade', 'wink', 'spectrum', 'random']);
+  let current = { mode: 'static', color: '#28ff03', speed: 209 };
+  let timer = null;
+
+  function setBusy(b) { document.body.classList.toggle('busy', b); }
+
+  function render(st) {
+    if (!st.ok) { $('#err').textContent = st.error || 'spectractl failed'; return; }
+    $('#err').textContent = '';
+    const color = (st.color || '#000000').toLowerCase();
+    $('#statline').innerHTML =
+      `<b>${st.power === 'on' ? 'On' : 'Off'}</b> · ${st.mode || '?'} · ${color}`;
+    $('#chip').textContent = st.controller || '';
+    $('#swatch').style.background = color;
+    $('#swatch').style.boxShadow = st.power === 'on' ? `0 0 18px ${color}55` : 'none';
+    if (st.mode) current.mode = st.mode;
+    if (st.color) { current.color = color; $('#color').value = color; }
+    document.querySelectorAll('button.mode').forEach(b =>
+      b.classList.toggle('active', b.dataset.mode === current.mode));
+    updateVisibility();
+  }
+
+  function updateVisibility() {
+    $('#colorcard').style.opacity = NEEDS_COLOR.has(current.mode) ? 1 : 0.35;
+    $('#speedcard').style.opacity = NEEDS_SPEED.has(current.mode) ? 1 : 0.35;
+  }
+
+  async function refresh() {
+    render(await window.spectra.status());
+  }
+
+  async function apply() {
+    setBusy(true);
+    const hex = current.color.replace('#', '').toUpperCase();
+    const cmd = current.mode === 'static'
+      ? { kind: 'color', color: hex }
+      : { kind: 'mode', mode: current.mode, color: hex, speed: current.speed };
+    const r = await window.spectra.apply(cmd);
+    if (!r.ok) $('#err').textContent = r.error || 'command failed';
+    await refresh();
+    setBusy(false);
+  }
+
+  // debounce so slider/picker drags don't spam the 200ms-cooldown MCU
+  function applySoon() {
+    clearTimeout(timer);
+    timer = setTimeout(apply, 350);
+  }
+
+  document.querySelectorAll('button.mode').forEach(b =>
+    b.addEventListener('click', () => {
+      current.mode = b.dataset.mode;
+      document.querySelectorAll('button.mode').forEach(x =>
+        x.classList.toggle('active', x === b));
+      updateVisibility();
+      applySoon();
+    }));
+
+  $('#color').addEventListener('input', (e) => {
+    current.color = e.target.value;
+    $('#swatch').style.background = current.color;
+    applySoon();
+  });
+
+  $('#speed').addEventListener('input', (e) => {
+    current.speed = Number(e.target.value);
+    $('#speedval').textContent = e.target.value;
+    if (NEEDS_SPEED.has(current.mode)) applySoon();
+  });
+
+  $('#on').addEventListener('click', async () => {
+    setBusy(true); await window.spectra.apply({ kind: 'on' }); await refresh(); setBusy(false);
+  });
+  $('#off').addEventListener('click', async () => {
+    setBusy(true); await window.spectra.apply({ kind: 'off' }); await refresh(); setBusy(false);
+  });
+
+  refresh();
+</script>
+</body>
+</html>
